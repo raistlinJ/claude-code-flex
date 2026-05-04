@@ -107,6 +107,10 @@ npm run repair:pty
 
 ## For Contributors
 
+### Contributing Guide
+
+- See CONTRIBUTING.md for branch workflow, PR expectations, and local development guidance.
+
 ### Project Layout
 
 - client: React UI (Vite)
