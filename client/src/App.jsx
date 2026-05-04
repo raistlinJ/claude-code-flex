@@ -81,10 +81,22 @@ const App = () => {
   }, []);
 
   useEffect(() => {
-    const ua = navigator.userAgent || '';
-    const mobileUA = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
-    const coarsePointer = window.matchMedia('(pointer: coarse)').matches;
-    setIsMobileBrowser(mobileUA || coarsePointer);
+    const detectMobile = () => {
+      const ua = navigator.userAgent || '';
+      const mobileUA = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+      const coarsePointer = window.matchMedia('(pointer: coarse)').matches;
+      const narrowViewport = window.matchMedia('(max-width: 900px)').matches;
+      setIsMobileBrowser(mobileUA || coarsePointer || narrowViewport);
+    };
+
+    detectMobile();
+    window.addEventListener('resize', detectMobile);
+    window.addEventListener('orientationchange', detectMobile);
+
+    return () => {
+      window.removeEventListener('resize', detectMobile);
+      window.removeEventListener('orientationchange', detectMobile);
+    };
   }, []);
 
   useEffect(() => {

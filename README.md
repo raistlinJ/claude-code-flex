@@ -2,6 +2,10 @@
 
 A local web interface for running Claude Code in a browser terminal, with optional provider bridging for Ollama and OpenAI-compatible endpoints.
 
+## Application Preview
+
+![Claude Code WebUI running](docs/images/app-running.png)
+
 ## For Users
 
 ### What You Get
@@ -21,27 +25,19 @@ A local web interface for running Claude Code in a browser terminal, with option
 
 ### Quick Start
 
-1. Install dependencies:
+1. Run the installer (installs/checks Node.js, npm, Claude CLI, OS-specific native terminal dependencies, project deps, and local cert/config):
 
 ```bash
-npm run install:all
+./install.sh
 ```
 
-2. Ensure TLS certs exist in server:
-
-```bash
-cd server
-./generate-certs.sh
-cd ..
-```
-
-3. Start frontend and backend:
+2. Start frontend and backend:
 
 ```bash
 npm run dev
 ```
 
-4. Open the app:
+3. Open the app:
 
 - http://localhost:5173
 
@@ -63,6 +59,7 @@ npm run dev
 - npm
 - Local TLS files in server: cert.pem and key.pem
 - Claude Code CLI available for terminal startup
+- Linux native terminal launch: `x-terminal-emulator` (installer attempts to install provider)
 
 Notes:
 
