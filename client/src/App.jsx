@@ -26,6 +26,7 @@ const App = () => {
   const sidebarWidthRef = useRef(sidebarWidth);
   const [config, setConfig] = useState({
     apiKey: localStorage.getItem('claude_apiKey') || '',
+    claudePath: localStorage.getItem('claude_claudePath') || '',
     baseUrl: localStorage.getItem('claude_baseUrl') || '',
     model: localStorage.getItem('claude_model') || '',
     provider: localStorage.getItem('claude_provider') || 'anthropic',
@@ -302,6 +303,20 @@ const App = () => {
             onChange={(e) => saveConfig('apiKey', e.target.value)}
             disabled={isConfigLocked}
           />
+        </div>
+
+        <div className="form-group">
+          <label><TerminalIcon size={14} style={{ marginRight: 6, verticalAlign: 'middle' }} /> Claude Executable Path (Optional)</label>
+          <input
+            type="text"
+            placeholder="claude"
+            value={config.claudePath}
+            onChange={(e) => saveConfig('claudePath', e.target.value)}
+            disabled={isConfigLocked}
+          />
+          <p style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: 4 }}>
+            Leave blank to use PATH default. Set a full path if Claude is installed in a custom location.
+          </p>
         </div>
 
         <div className="form-group">

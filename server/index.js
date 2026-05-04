@@ -200,6 +200,7 @@ const buildSessionBanner = (config, sessionEnv) => {
     `[Session] auth_mode=${authMode}`,
     `[Session] api_key_set=${sessionEnv.ANTHROPIC_API_KEY ? 'yes' : 'no'}`,
     `[Session] bypass_permissions=${config.allowBypassPermissions ? 'on' : 'off'}`,
+    `[Session] claude_exec=${getClaudeExecutable(config)}`,
     `[Session] pty_backend=${nodePtyStatus.available ? 'node-pty' : 'python-fallback'}`,
     ...(nodePtyStatus.available ? [] : [`[Session] pty_reason=${nodePtyStatus.reason}`]),
     ''
@@ -215,6 +216,23 @@ const buildClaudeCliArgs = (config) => {
     : '';
   return `${modelArg}${bypassArg}`;
 };
+
+const getClaudeExecutable = (config = {}) => {
+  const fromConfig = config?.claudePath && String(config.claudePath).trim();
+  if (fromConfig) return fromConfig;
+
+  const fromEnv = process.env.CLAUDE_PATH && String(process.env.CLAUDE_PATH).trim();
+  return fromEnv || 'claude';
+};
+
+const quoteForBash = (value) => `'${String(value).replace(/'/g, `'"'"'`)}'`;
+const quoteForPowerShell = (value) => `'${String(value).replace(/'/g, "''")}'`;
+const quoteForInteractiveShell = (value) => {
+  const text = String(value);
+  return /\s/.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text;
+};
+
+const buildClaudeShellCommand = (config) => `${quoteForInteractiveShell(getClaudeExecutable(config))}${buildClaudeCliArgs(config)}`;
 
 const loadConfig = () => {
   try {
@@ -296,7 +314,7 @@ io.on('connection', (socket) => {
     const setupPtyHandlers = (proc) => {
       if (config.autoStart) {
         setTimeout(() => {
-          if (proc) proc.write(`claude${buildClaudeCliArgs(config)}\r`);
+          if (proc) proc.write(`${buildClaudeShellCommand(config)}\r`);
         }, 1200);
       }
 
@@ -336,8 +354,7 @@ io.on('connection', (socket) => {
       if (config.autoStart) {
         setTimeout(() => {
           console.log('[Fallback] Starting claude via Python PTY');
-          const CLAUDE_PATH = '/Users/jcacosta/.local/bin/claude';
-          cp.stdin.write(`${CLAUDE_PATH}${buildClaudeCliArgs(config)}\n`);
+          cp.stdin.write(`${buildClaudeShellCommand(config)}\n`);
         }, 1500);
       }
     };
@@ -380,7 +397,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// Native Terminal Launcher (macOS)
+// Native Terminal Launcher (cross-platform)
 app.post('/v1/terminal/launch', (req, res) => {
   const config = req.body;
   // Keep bridge config in sync with native-launch session settings.
@@ -401,7 +418,7 @@ app.post('/v1/terminal/launch', (req, res) => {
     ? `ANTHROPIC_API_KEY="${String(sessionEnv.ANTHROPIC_API_KEY).replace(/"/g, '\\"')}" `
     : '';
 
-  const CLAUDE_PATH = '/Users/jcacosta/.local/bin/claude';
+  const claudeExec = getClaudeExecutable(config);
   const banner = [
     '[Session] Claude WebUI runtime',
     `[Session] provider=${provider}`,
@@ -411,24 +428,79 @@ app.post('/v1/terminal/launch', (req, res) => {
     `[Session] api_key_set=${sessionEnv.ANTHROPIC_API_KEY ? 'yes' : 'no'}`,
     `[Session] bypass_permissions=${config.allowBypassPermissions ? 'on' : 'off'}`,
     ''
-  ].join('\\n');
-  const command = `cd "${config.cwd}" && printf '%s\\n' "${banner.replace(/"/g, '\\"')}" && env ${apiKeyEnv}${envStr} ${CLAUDE_PATH}${buildClaudeCliArgs(config)}`;
-  
-  // AppleScript to open a new terminal window and run the command
-  const appleScript = `
-    tell application "Terminal"
-      do script "${command.replace(/"/g, '\\"')}"
-      activate
-    end tell
-  `;
+  ];
 
-  exec(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`, (err) => {
-    if (err) {
+  if (process.platform === 'darwin') {
+    const command = `cd "${config.cwd}" && printf '%s\\n' "${banner.join('\\n').replace(/"/g, '\\"')}" && env ${apiKeyEnv}${envStr} ${quoteForBash(claudeExec)}${buildClaudeCliArgs(config)}`;
+    const appleScript = `
+      tell application "Terminal"
+        do script "${command.replace(/"/g, '\\"')}"
+        activate
+      end tell
+    `;
+
+    exec(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`, (err) => {
+      if (err) {
+        console.error('[Terminal Launch Error]', err);
+        return res.status(500).json({ error: err.message });
+      }
+      res.json({ success: true });
+    });
+    return;
+  }
+
+  if (process.platform === 'win32') {
+    const psLines = [
+      `$env:ANTHROPIC_BASE_URL=${quoteForPowerShell(sessionEnv.ANTHROPIC_BASE_URL)}`,
+      `$env:CLAUDE_CODE_MODEL=${quoteForPowerShell(sessionEnv.CLAUDE_CODE_MODEL)}`,
+      `$env:NODE_TLS_REJECT_UNAUTHORIZED=${quoteForPowerShell(sessionEnv.NODE_TLS_REJECT_UNAUTHORIZED)}`,
+      ...(sessionEnv.ANTHROPIC_API_KEY ? [`$env:ANTHROPIC_API_KEY=${quoteForPowerShell(sessionEnv.ANTHROPIC_API_KEY)}`] : []),
+      `Set-Location -Path ${quoteForPowerShell(config.cwd)}`,
+      ...banner.filter(Boolean).map((line) => `Write-Host ${quoteForPowerShell(line)}`),
+      `& ${quoteForPowerShell(claudeExec)}${buildClaudeCliArgs(config)}`
+    ];
+
+    const powershellArgs = ['-NoExit', '-ExecutionPolicy', 'Bypass', '-Command', psLines.join('; ')];
+    const child = spawn('powershell.exe', powershellArgs, {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: false
+    });
+
+    child.on('error', (err) => {
       console.error('[Terminal Launch Error]', err);
-      return res.status(500).json({ error: err.message });
-    }
+      if (!res.headersSent) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    child.unref();
     res.json({ success: true });
+    return;
+  }
+
+  const envPairs = [
+    `ANTHROPIC_BASE_URL=${quoteForBash(sessionEnv.ANTHROPIC_BASE_URL)}`,
+    `CLAUDE_CODE_MODEL=${quoteForBash(sessionEnv.CLAUDE_CODE_MODEL)}`,
+    `NODE_TLS_REJECT_UNAUTHORIZED=${quoteForBash(sessionEnv.NODE_TLS_REJECT_UNAUTHORIZED)}`,
+    ...(sessionEnv.ANTHROPIC_API_KEY ? [`ANTHROPIC_API_KEY=${quoteForBash(sessionEnv.ANTHROPIC_API_KEY)}`] : [])
+  ];
+  const linuxBanner = banner.filter(Boolean).map((line) => `echo ${quoteForBash(line)}`).join('; ');
+  const linuxCommand = `cd ${quoteForBash(config.cwd)}; ${linuxBanner}; export ${envPairs.join(' ')}; ${quoteForBash(claudeExec)}${buildClaudeCliArgs(config)}; exec bash`;
+  const linuxChild = spawn('x-terminal-emulator', ['-e', 'bash', '-lc', linuxCommand], {
+    detached: true,
+    stdio: 'ignore'
   });
+
+  linuxChild.on('error', (err) => {
+    console.error('[Terminal Launch Error]', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'No supported terminal launcher found. Install x-terminal-emulator or use web terminal.' });
+    }
+  });
+
+  linuxChild.unref();
+  res.json({ success: true });
 });
 app.get('/v1/fs/ls', async (req, res) => {
   const targetPath = req.query.path || process.cwd();

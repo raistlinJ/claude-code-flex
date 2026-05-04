@@ -9,7 +9,7 @@ A local web interface for running Claude Code in a browser terminal, with option
 - Browser-based terminal powered by xterm.js
 - One-click web terminal session startup
 - Session survives browser refresh and reconnects with terminal output restored
-- One-click native macOS Terminal launch
+- One-click native terminal launch (macOS, Windows, Linux)
 - Configurable provider, model, API key, and working directory
 - Resizable left config panel with drag handle
 - Collapsible config panel with `<` and `>` toggle button
@@ -49,12 +49,13 @@ npm run dev
 
 1. Select provider: Anthropic, Ollama, or OpenAI-compatible.
 2. Enter API key if required by provider.
-3. Set base URL when needed.
-4. Click Fetch Models and pick a model.
-5. Choose a working directory with Browse, or create one directly inside the Browse dialog.
-6. On mobile, switch between Config and Terminal using tabs at the top.
-7. On desktop, resize or collapse the left config panel using the drag edge and `<`/`>` toggle.
-8. Start Web Terminal or Launch in Native Terminal.
+3. Optionally set Claude Executable Path if `claude` is not available on your PATH.
+4. Set base URL when needed.
+5. Click Fetch Models and pick a model.
+6. Choose a working directory with Browse, or create one directly inside the Browse dialog.
+7. On mobile, switch between Config and Terminal using tabs at the top.
+8. On desktop, resize or collapse the left config panel using the drag edge and `<`/`>` toggle.
+9. Start Web Terminal or Launch in Native Terminal.
 
 ### Requirements
 
@@ -65,8 +66,12 @@ npm run dev
 
 Notes:
 
-- Native launch currently targets macOS Terminal via osascript.
-- Current implementation uses a hardcoded Claude binary path in some server launch paths.
+- Native launch uses platform-specific terminal opening:
+- macOS: Terminal via AppleScript
+- Windows: PowerShell window
+- Linux: `x-terminal-emulator` fallback
+- `CLAUDE_PATH` can be set to override the Claude executable used for launch.
+- The WebUI also supports an optional Claude Executable Path field, which overrides the default command for that saved config.
 
 ### Common Commands
 
@@ -102,8 +107,9 @@ npm run repair:pty
 
 5. Native terminal launch fails.
 
-- Confirm macOS Terminal permissions.
-- Confirm osascript is available.
+- macOS: confirm Terminal permissions and `osascript` availability.
+- Windows: confirm `powershell.exe` is available in PATH.
+- Linux: ensure `x-terminal-emulator` is installed, or use the web terminal.
 
 ## For Contributors
 
@@ -143,6 +149,7 @@ npm run repair:pty
 - node-pty with zsh/bash/sh
 - Python PTY fallback if node-pty fails
 - Native macOS terminal launch endpoint:
+- Native terminal launch endpoint (platform-specific):
 - POST /v1/terminal/launch
 - File browser endpoint:
 - GET /v1/fs/ls?path=...
