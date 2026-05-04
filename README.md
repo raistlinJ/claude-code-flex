@@ -8,9 +8,10 @@ A local web interface for running Claude Code in a browser terminal, with option
 
 ### Mobile Preview
 
-![Claude Code WebUI mobile config tab](docs/images/mobile-config.png)
-
-![Claude Code WebUI mobile terminal tab](docs/images/mobile-code.png)
+<p align="center">
+  <img src="docs/images/mobile-config.png" width="263" alt="Claude Code WebUI mobile config tab" />
+  <img src="docs/images/mobile-code.png" width="263" alt="Claude Code WebUI mobile terminal tab" />
+</p>
 
 ## For Users
 
