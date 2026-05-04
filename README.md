@@ -6,6 +6,12 @@ A local web interface for running Claude Code in a browser terminal, with option
 
 ![Claude Code WebUI running](docs/images/app-running.png)
 
+### Mobile Preview
+
+![Claude Code WebUI mobile config tab](docs/images/mobile-config.png)
+
+![Claude Code WebUI mobile terminal tab](docs/images/mobile-code.png)
+
 ## For Users
 
 ### What You Get
