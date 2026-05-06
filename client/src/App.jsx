@@ -4,9 +4,52 @@ import { Settings, Play, Square, Terminal as TerminalIcon, Shield, Server, Cpu }
 import Terminal from './components/Terminal';
 import FileBrowser from './components/FileBrowser';
 
+const DEFAULT_CONFIG = {
+  apiKey: '',
+  claudePath: '',
+  baseUrl: '',
+  model: '',
+  provider: 'anthropic',
+  cwd: '',
+  autoStart: true,
+  allowBypassPermissions: false
+};
+
+const normalizeConfig = (config = {}) => ({
+  ...DEFAULT_CONFIG,
+  ...config,
+  autoStart: true,
+  allowBypassPermissions: config.allowBypassPermissions ?? DEFAULT_CONFIG.allowBypassPermissions
+});
+
+const readStoredBoolean = (key, fallback) => {
+  const rawValue = localStorage.getItem(`claude_${key}`);
+  if (rawValue === null) return fallback;
+  return rawValue === 'true';
+};
+
+const readStoredConfig = () => normalizeConfig({
+  apiKey: localStorage.getItem('claude_apiKey') || '',
+  claudePath: localStorage.getItem('claude_claudePath') || '',
+  baseUrl: localStorage.getItem('claude_baseUrl') || '',
+  model: localStorage.getItem('claude_model') || '',
+  provider: localStorage.getItem('claude_provider') || DEFAULT_CONFIG.provider,
+  cwd: localStorage.getItem('claude_cwd') || '',
+  allowBypassPermissions: readStoredBoolean('allowBypassPermissions', DEFAULT_CONFIG.allowBypassPermissions)
+});
+
+const persistConfig = (config) => {
+  const normalizedConfig = normalizeConfig(config);
+  Object.entries(normalizedConfig).forEach(([key, value]) => {
+    localStorage.setItem(`claude_${key}`, String(value ?? ''));
+  });
+  return normalizedConfig;
+};
+
 const App = () => {
   const [socket, setSocket] = useState(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [hasLoadedConfig, setHasLoadedConfig] = useState(false);
   const [isSessionActive, setIsSessionActive] = useState(false);
   const [sessionResetKey, setSessionResetKey] = useState(0);
   const [isBrowserOpen, setIsBrowserOpen] = useState(false);
@@ -23,20 +66,18 @@ const App = () => {
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   const [terminalSize, setTerminalSize] = useState({ cols: 80, rows: 24 });
   const [terminalHistory, setTerminalHistory] = useState('');
+  const [nativeLaunchState, setNativeLaunchState] = useState('idle');
+  const [nativeLaunchMessage, setNativeLaunchMessage] = useState('');
   const sidebarWidthRef = useRef(sidebarWidth);
-  const [config, setConfig] = useState({
-    apiKey: localStorage.getItem('claude_apiKey') || '',
-    claudePath: localStorage.getItem('claude_claudePath') || '',
-    baseUrl: localStorage.getItem('claude_baseUrl') || '',
-    model: localStorage.getItem('claude_model') || '',
-    provider: localStorage.getItem('claude_provider') || 'anthropic',
-    cwd: localStorage.getItem('claude_cwd') || '',
-    autoStart: true,
-    allowBypassPermissions: localStorage.getItem('claude_allowBypassPermissions') === 'true'
-  });
+  const [config, setConfig] = useState(() => readStoredConfig());
+  const configRef = useRef(config);
 
   const [models, setModels] = useState([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
+
+  useEffect(() => {
+    configRef.current = config;
+  }, [config]);
 
   useEffect(() => {
     const newSocket = io({
@@ -46,22 +87,25 @@ const App = () => {
 
     newSocket.on('connect', () => {
       setIsConnected(true);
-      fetchModels(); // Auto-fetch on connect
       newSocket.emit('terminal-sync-request');
     });
 
     newSocket.on('config-loaded', (serverConfig) => {
       console.log('Server config received:', serverConfig);
-      if (serverConfig && Object.keys(serverConfig).length > 0) {
-        setConfig(prev => ({
-          ...prev,
-          ...serverConfig
-        }));
-      }
+      const mergedConfig = persistConfig({
+        ...configRef.current,
+        ...(serverConfig || {})
+      });
+
+      configRef.current = mergedConfig;
+      setConfig(mergedConfig);
+      setHasLoadedConfig(true);
+      fetchModels(mergedConfig);
     });
 
     newSocket.on('disconnect', () => {
       setIsConnected(false);
+      setHasLoadedConfig(false);
       setIsSessionActive(false);
     });
 
@@ -136,16 +180,21 @@ const App = () => {
     };
   }, [isResizingSidebar]);
 
-  const fetchModels = async () => {
+  const fetchModels = async (configOverride = configRef.current) => {
     if (isSessionActive) return;
+    const activeConfig = normalizeConfig(configOverride);
     setIsFetchingModels(true);
     try {
-      const response = await fetch('/v1/models');
+      const response = await fetch('/v1/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(activeConfig)
+      });
       const data = await response.json();
-      if (data.models) {
+      if (data.models?.length) {
         setModels(data.models);
         // If current model is not in the list, select the first one
-        if (!config.model || !data.models.find(m => m.id === config.model)) {
+        if (!activeConfig.model || !data.models.find(m => m.id === activeConfig.model)) {
           saveConfig('model', data.models[0].id);
         }
       }
@@ -158,7 +207,7 @@ const App = () => {
 
   const saveConfig = (key, value) => {
     if (isSessionActive) return;
-    const newConfig = { ...config, [key]: value };
+    const newConfig = { ...configRef.current, [key]: value };
     
     // Auto-fill defaults for providers
     if (key === 'provider') {
@@ -173,37 +222,60 @@ const App = () => {
     }
 
     // Save to local state
-    setConfig(newConfig);
-
-    // Save to localStorage
-    Object.keys(newConfig).forEach(k => {
-      if (k !== 'autoStart') localStorage.setItem(`claude_${k}`, newConfig[k]);
-    });
+    const persistedConfig = persistConfig(newConfig);
+    configRef.current = persistedConfig;
+    setConfig(persistedConfig);
 
     // Save to server
     if (socket) {
-      console.log('Sending config update to server:', newConfig);
-      socket.emit('update-config', newConfig);
+      console.log('Sending config update to server:', persistedConfig);
+      socket.emit('update-config', persistedConfig);
     }
   };
 
   const launchNativeTerminal = async () => {
+    setNativeLaunchState('idle');
+    setNativeLaunchMessage('');
+
     try {
-      await fetch('/v1/terminal/launch', {
+      if (!isConnected) {
+        throw new Error('Server is offline. Start the backend before launching a native terminal.');
+      }
+
+      const launchConfig = normalizeConfig(configRef.current);
+      setNativeLaunchState('launching');
+      const response = await fetch('/v1/terminal/launch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(config)
+        body: JSON.stringify(launchConfig)
       });
+
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch (_) {
+        payload = null;
+      }
+
+      if (!response.ok) {
+        throw new Error(payload?.error || 'Native terminal launch failed.');
+      }
+
+      setNativeLaunchState('success');
+      setNativeLaunchMessage('Native terminal launch requested. If no window appears, check the backend log for a Windows spawn error.');
     } catch (err) {
+      setNativeLaunchState('error');
+      setNativeLaunchMessage(err.message || 'Native terminal launch failed.');
       console.error('Error launching native terminal:', err);
     }
   };
 
   const startSession = () => {
     if (socket) {
+      const sessionConfig = normalizeConfig(configRef.current);
       setSessionResetKey(prev => prev + 1);
       setTerminalHistory('');
-      socket.emit('start-session', config);
+      socket.emit('start-session', sessionConfig);
       setIsSessionActive(true);
       setMobileActiveTab('terminal');
     }
@@ -354,7 +426,7 @@ const App = () => {
               className="btn btn-secondary" 
               style={{ padding: '2px 8px', fontSize: '0.7rem' }}
               onClick={fetchModels}
-              disabled={isFetchingModels || isConfigLocked}
+              disabled={isFetchingModels || isConfigLocked || !hasLoadedConfig}
             >
               {isFetchingModels ? 'Fetching...' : 'Fetch Models'}
             </button>
@@ -397,6 +469,12 @@ const App = () => {
         </div>
 
         <div className="form-group">
+          <p style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: 4 }}>
+            Claude launches automatically using the saved model and current provider settings.
+          </p>
+        </div>
+
+        <div className="form-group">
           <div className="toggle-row">
             <span className="toggle-label">Allow Bypass Permissions</span>
             <label className="switch" aria-label="Allow Bypass Permissions">
@@ -430,21 +508,33 @@ const App = () => {
             <button 
               className="btn btn-primary" 
               onClick={launchNativeTerminal}
-              disabled={!config.model || !config.cwd}
+              disabled={nativeLaunchState === 'launching' || !isConnected || !hasLoadedConfig || !config.model || !config.cwd}
               style={{ background: 'linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)', color: '#000', fontWeight: 700 }}
             >
               <TerminalIcon size={16} style={{ marginRight: 8 }} />
-              Launch in Native Terminal
+              {nativeLaunchState === 'launching' ? 'Launching...' : 'Launch in Native Terminal'}
             </button>
+          )}
+
+          {!isMobileBrowser && nativeLaunchMessage && (
+            <p
+              style={{
+                marginTop: -4,
+                fontSize: '0.72rem',
+                color: nativeLaunchState === 'error' ? 'var(--danger-color)' : 'var(--text-secondary)'
+              }}
+            >
+              {nativeLaunchMessage}
+            </p>
           )}
 
           <button 
             className="btn btn-secondary" 
             onClick={startSession}
-            disabled={isSessionActive || !isConnected || !config.model || !config.cwd}
+            disabled={isSessionActive || !isConnected || !hasLoadedConfig || !config.model || !config.cwd}
           >
             <Play size={16} style={{ marginRight: 8 }} />
-            {!config.model ? 'Select a Model' : !config.cwd ? 'Enter Directory' : 'Start Web Terminal'}
+            {!hasLoadedConfig ? 'Loading Config...' : !config.model ? 'Select a Model' : !config.cwd ? 'Enter Directory' : 'Start Web Terminal'}
           </button>
 
           {isSessionActive && (

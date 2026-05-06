@@ -34,14 +34,30 @@ A local web interface for running Claude Code in a browser terminal, with option
 
 1. Run the installer (installs/checks Node.js, npm, Claude CLI, OS-specific native terminal dependencies, project deps, and local cert/config):
 
+macOS/Linux:
+
 ```bash
 ./install.sh
 ```
 
+Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
 2. Start frontend and backend:
+
+macOS/Linux or Windows CMD:
 
 ```bash
 npm run dev
+```
+
+Windows PowerShell:
+
+```powershell
+npm.cmd run dev
 ```
 
 3. Open the app:
@@ -84,8 +100,11 @@ npm run dev
 npm run dev:server
 npm run dev:client
 npm run install:all
+npm --prefix server run generate:certs
 npm run repair:pty
 ```
+
+Windows PowerShell: prefer `npm.cmd ...` if your execution policy blocks `npm.ps1`.
 
 ### Troubleshooting
 
@@ -99,7 +118,12 @@ npm run repair:pty
 - Run `npm run repair:pty` to repair node-pty helper permissions.
 - Restart the server and verify startup logs include `node-pty self-test: OK`.
 
-3. No models appear.
+3. PowerShell blocks `npm` with an execution policy error.
+
+- Use `npm.cmd` instead of `npm`, for example `npm.cmd run dev`.
+- For a one-off session, `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` also works.
+
+4. No models appear.
 
 - Verify provider, base URL, and API key.
 - For Ollama, ensure service is running and reachable.
@@ -125,7 +149,7 @@ npm run repair:pty
 
 - client: React UI (Vite)
 - server: HTTPS API, socket server, PTY lifecycle, protocol bridge
-- install.sh: helper installer
+- install.sh / install.ps1: helper installers
 - package.json: root orchestration scripts
 
 ### Runtime Architecture

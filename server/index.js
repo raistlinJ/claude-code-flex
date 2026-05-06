@@ -33,11 +33,48 @@ const io = new Server(httpServer, {
   }
 });
 
-const shell = os.platform() === 'win32' ? 'powershell.exe' : 'zsh';
+const getDefaultCwd = () => process.env.HOME || process.env.USERPROFILE || process.cwd();
+
+const isPowerShellShell = (command) => /(?:^|\\)(powershell|pwsh)\.exe$/i.test(command);
+
+const getShellCandidates = () => {
+  if (process.platform === 'win32') {
+    const windowsShells = [
+      process.env.ComSpec || 'cmd.exe',
+      'cmd.exe',
+      'powershell.exe',
+      'pwsh.exe',
+      'powershell.exe'
+    ].filter((command, index, commands) => command && commands.indexOf(command) === index);
+
+    return windowsShells.map((command) => ({
+      command,
+      args: isPowerShellShell(command) ? ['-NoLogo'] : []
+    }));
+  }
+
+  return ['/bin/zsh', '/bin/bash', 'sh'].map((command) => ({ command, args: [] }));
+};
+
+const buildPtyEnv = (baseEnv = process.env) => ({
+  ...baseEnv,
+  HOME: baseEnv.HOME || process.env.HOME || os.homedir(),
+  TERM: baseEnv.TERM || 'xterm-256color'
+});
+
+const getPtySpawnOptions = (cwd, env) => ({
+  name: 'xterm-color',
+  cols: 80,
+  rows: 24,
+  cwd,
+  env: buildPtyEnv(env),
+  ...(process.platform === 'win32' ? { useConpty: false } : {})
+});
 
 const nodePtyStatus = {
   available: true,
-  reason: 'not-tested'
+  reason: 'not-tested',
+  shell: null
 };
 
 let activePtyProcess = null;
@@ -125,24 +162,25 @@ const clearActiveSession = (exitCode = 0, signal = 'session-closed') => {
 };
 
 const detectNodePtyAvailability = () => {
-  try {
-    const test = pty.spawn('/bin/zsh', [], {
-      name: 'xterm-color',
-      cols: 80,
-      rows: 24,
-      cwd: process.cwd(),
-      env: {
-        PATH: process.env.PATH,
-        HOME: process.env.HOME,
-        TERM: 'xterm-256color'
-      }
-    });
-    test.kill();
-    nodePtyStatus.available = true;
-    nodePtyStatus.reason = 'ok';
-  } catch (err) {
-    nodePtyStatus.available = false;
-    nodePtyStatus.reason = err?.message || 'unknown-error';
+  const shellCandidates = getShellCandidates();
+
+  for (const shellCandidate of shellCandidates) {
+    try {
+      const test = pty.spawn(
+        shellCandidate.command,
+        shellCandidate.args,
+        getPtySpawnOptions(process.cwd(), process.env)
+      );
+      test.kill();
+      nodePtyStatus.available = true;
+      nodePtyStatus.reason = 'ok';
+      nodePtyStatus.shell = shellCandidate;
+      return;
+    } catch (err) {
+      nodePtyStatus.available = false;
+      nodePtyStatus.reason = `${shellCandidate.command}: ${err?.message || 'unknown-error'}`;
+      nodePtyStatus.shell = null;
+    }
   }
 };
 
@@ -175,9 +213,11 @@ const buildClaudeSessionEnv = (config) => {
     ? String(config.apiKey).trim()
     : '';
 
-  if (explicitApiKey) {
+  if (provider === 'anthropic' && explicitApiKey) {
     sessionEnv.ANTHROPIC_API_KEY = explicitApiKey;
   } else if (provider !== 'anthropic') {
+    // Bridge providers authenticate upstream in the local backend, so Claude only
+    // needs a stable placeholder key here to bypass interactive login prompts.
     sessionEnv.ANTHROPIC_API_KEY = 'local-provider-key';
   } else {
     delete sessionEnv.ANTHROPIC_API_KEY;
@@ -221,12 +261,21 @@ const getClaudeExecutable = (config = {}) => {
   const fromConfig = config?.claudePath && String(config.claudePath).trim();
   if (fromConfig) return fromConfig;
 
+  if (process.platform === 'win32') {
+    const localInstallPath = path.join(os.homedir(), '.local', 'bin', 'claude.exe');
+    if (fs.existsSync(localInstallPath)) {
+      return localInstallPath;
+    }
+  }
+
   const fromEnv = process.env.CLAUDE_PATH && String(process.env.CLAUDE_PATH).trim();
   return fromEnv || 'claude';
 };
 
 const quoteForBash = (value) => `'${String(value).replace(/'/g, `'"'"'`)}'`;
+const quoteForCmd = (value) => `"${String(value).replace(/"/g, '""')}"`;
 const quoteForPowerShell = (value) => `'${String(value).replace(/'/g, "''")}'`;
+const escapeForCmdValue = (value) => String(value).replace(/%/g, '%%').replace(/"/g, '""');
 const quoteForInteractiveShell = (value) => {
   const text = String(value);
   return /\s/.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text;
@@ -234,23 +283,67 @@ const quoteForInteractiveShell = (value) => {
 
 const buildClaudeShellCommand = (config) => `${quoteForInteractiveShell(getClaudeExecutable(config))}${buildClaudeCliArgs(config)}`;
 
+const DEFAULT_SESSION_CONFIG = {
+  apiKey: '',
+  claudePath: '',
+  baseUrl: '',
+  model: '',
+  provider: 'anthropic',
+  cwd: process.cwd(),
+  autoStart: true,
+  allowBypassPermissions: false
+};
+
+const normalizeStoredConfig = (config = {}) => ({
+  ...DEFAULT_SESSION_CONFIG,
+  ...config,
+  provider: typeof config.provider === 'string' && config.provider.trim()
+    ? config.provider
+    : DEFAULT_SESSION_CONFIG.provider,
+  cwd: typeof config.cwd === 'string' && config.cwd.trim()
+    ? config.cwd
+    : DEFAULT_SESSION_CONFIG.cwd,
+  autoStart: true,
+  allowBypassPermissions: config.allowBypassPermissions ?? DEFAULT_SESSION_CONFIG.allowBypassPermissions
+});
+
+const preferLaunchString = (incomingValue, savedValue, fallback = '') => {
+  if (typeof incomingValue === 'string' && incomingValue.trim()) return incomingValue;
+  if (typeof savedValue === 'string' && savedValue.trim()) return savedValue;
+  return fallback;
+};
+
 const loadConfig = () => {
   try {
     if (fs.existsSync(CONFIG_PATH)) {
-      return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+      return normalizeStoredConfig(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')));
     }
   } catch (err) {
     console.error('Error loading config:', err);
   }
-  return {};
+  return normalizeStoredConfig();
 };
 
 const saveConfig = (config) => {
   try {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(normalizeStoredConfig(config), null, 2));
   } catch (err) {
     console.error('Error saving config:', err);
   }
+};
+
+const buildLaunchConfig = (incomingConfig = {}) => {
+  const savedConfig = loadConfig();
+
+  return normalizeStoredConfig({
+    ...savedConfig,
+    ...incomingConfig,
+    claudePath: preferLaunchString(incomingConfig.claudePath, savedConfig.claudePath, ''),
+    model: preferLaunchString(incomingConfig.model, savedConfig.model, ''),
+    cwd: preferLaunchString(incomingConfig.cwd, savedConfig.cwd, DEFAULT_SESSION_CONFIG.cwd),
+    autoStart: true,
+    allowBypassPermissions: incomingConfig.allowBypassPermissions ?? savedConfig.allowBypassPermissions
+  });
 };
 
 io.on('connection', (socket) => {
@@ -258,7 +351,6 @@ io.on('connection', (socket) => {
 
   // Send current config to client
   const initialConfig = loadConfig();
-  if (!initialConfig.cwd) initialConfig.cwd = process.cwd();
   socket.emit('config-loaded', initialConfig);
   emitSessionState(socket);
   if (activePtyProcess && terminalHistory) {
@@ -269,11 +361,13 @@ io.on('connection', (socket) => {
     saveConfig(newConfig);
   });
 
-  socket.on('start-session', (config) => {
+  socket.on('start-session', (requestedConfig) => {
     if (activePtyProcess) {
       terminateActiveSessionProcess('restarted');
       clearActiveSession(0, 'restarted');
     }
+
+    const config = buildLaunchConfig(requestedConfig);
 
     console.log(`[Session] Starting session for ${socket.id} (AutoStart: ${config.autoStart})`);
     // Keep bridge config in sync with the exact values used to start this session.
@@ -281,6 +375,12 @@ io.on('connection', (socket) => {
     activeSessionConfig = config;
     terminalHistory = '';
     const sessionEnv = buildClaudeSessionEnv(config);
+    const shellCandidates = nodePtyStatus.shell
+      ? [
+          nodePtyStatus.shell,
+          ...getShellCandidates().filter((candidate) => candidate.command !== nodePtyStatus.shell.command)
+        ]
+      : getShellCandidates();
     broadcastTerminalData(`\r\n${buildSessionBanner(config, sessionEnv)}\r\n`);
     io.emit('session-state', { active: true, config: activeSessionConfig });
 
@@ -293,20 +393,18 @@ io.on('connection', (socket) => {
       
       const currentShell = shells[0];
       try {
-        console.log(`[Session] Attempting PTY spawn: ${currentShell}`);
-        activePtyProcess = pty.spawn(currentShell, [], {
-          name: 'xterm-color',
-          cols: 80,
-          rows: 24,
-          cwd: config.cwd || process.env.HOME || '/',
-          env: currentEnv
-        });
+        console.log(`[Session] Attempting PTY spawn: ${currentShell.command}`);
+        activePtyProcess = pty.spawn(
+          currentShell.command,
+          currentShell.args,
+          getPtySpawnOptions(config.cwd || getDefaultCwd(), currentEnv)
+        );
 
         console.log(`[Session] Success! PTY spawned (PID: ${activePtyProcess.pid})`);
         setupPtyHandlers(activePtyProcess);
 
       } catch (err) {
-        console.warn(`[Session Warning] PTY spawn failed for ${currentShell}:`, err.message);
+        console.warn(`[Session Warning] PTY spawn failed for ${currentShell.command}:`, err.message);
         spawnWithFallback(shells.slice(1), currentEnv);
       }
     };
@@ -326,14 +424,26 @@ io.on('connection', (socket) => {
     };
 
     const spawnChildProcessFallback = (currentEnv) => {
-      broadcastTerminalData('\r\n[System] node-pty failed. Attempting Python PTY fallback...\r\n');
-      
-      // Use Python's built-in pty module to create a real PTY
-      const cp = spawn('python3', ['-c', "import pty; pty.spawn(['/bin/zsh', '-i'])"], {
-        env: currentEnv,
-        cwd: config.cwd || process.env.HOME,
-        stdio: ['pipe', 'pipe', 'pipe']
-      });
+      const fallbackShell = shellCandidates[0] || { command: 'powershell.exe', args: ['-NoLogo'] };
+      let cp;
+
+      if (process.platform === 'win32') {
+        broadcastTerminalData(`\r\n[System] node-pty failed. Attempting pipe fallback with ${fallbackShell.command}.\r\n`);
+        cp = spawn(fallbackShell.command, fallbackShell.args, {
+          env: buildPtyEnv(currentEnv),
+          cwd: config.cwd || getDefaultCwd(),
+          stdio: ['pipe', 'pipe', 'pipe']
+        });
+      } else {
+        const interactiveArgs = [...fallbackShell.args, '-i'];
+        const pythonCommand = `import pty; pty.spawn(${JSON.stringify([fallbackShell.command, ...interactiveArgs])})`;
+        broadcastTerminalData(`\r\n[System] node-pty failed. Attempting Python PTY fallback with ${fallbackShell.command}.\r\n`);
+        cp = spawn('python3', ['-c', pythonCommand], {
+          env: buildPtyEnv(currentEnv),
+          cwd: config.cwd || getDefaultCwd(),
+          stdio: ['pipe', 'pipe', 'pipe']
+        });
+      }
 
       const fallbackProc = {
         write: (data) => cp.stdin.write(data),
@@ -365,7 +475,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    spawnWithFallback(['/bin/zsh', '/bin/bash', 'sh'], sessionEnv);
+    spawnWithFallback(shellCandidates, sessionEnv);
   });
 
   socket.on('terminal-input', (data) => {
@@ -397,9 +507,60 @@ io.on('connection', (socket) => {
   });
 });
 
+const handleModelsRequest = async (req, res) => {
+  const config = req.method === 'POST'
+    ? normalizeStoredConfig(req.body || {})
+    : loadConfig();
+  const provider = config.provider || 'anthropic';
+  const targetUrl = config.baseUrl || 'http://localhost:11434/v1';
+
+  console.log(`[Bridge] Fetching models for ${provider} from ${targetUrl}`);
+
+  if (provider === 'anthropic') {
+    return res.json({
+      models: [
+        { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet' },
+        { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku' },
+        { id: 'claude-3-opus-20240229', name: 'Claude 3 Opus' },
+        { id: 'claude-3-sonnet-20240229', name: 'Claude 3 Sonnet' },
+        { id: 'claude-3-haiku-20240307', name: 'Claude 3 Haiku' }
+      ]
+    });
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
+    let url = '';
+    if (provider === 'ollama') {
+      const base = targetUrl.replace('/v1', '');
+      url = `${base}/api/tags`;
+      const response = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeout);
+      const data = await response.json();
+      const models = data.models.map(m => ({ id: m.name, name: m.name }));
+      return res.json({ models });
+    }
+
+    url = `${targetUrl}/models`;
+    const response = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${config.apiKey || 'dummy'}` },
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    const data = await response.json();
+    const models = data.data.map(m => ({ id: m.id, name: m.id }));
+    return res.json({ models });
+  } catch (err) {
+    console.error('[Models Fetch Error]', err);
+    res.status(500).json({ error: err.name === 'AbortError' ? 'Request timed out' : err.message });
+  }
+};
+
 // Native Terminal Launcher (cross-platform)
 app.post('/v1/terminal/launch', (req, res) => {
-  const config = req.body;
+  const config = buildLaunchConfig(req.body);
   // Keep bridge config in sync with native-launch session settings.
   saveConfig(config);
 
@@ -450,21 +611,34 @@ app.post('/v1/terminal/launch', (req, res) => {
   }
 
   if (process.platform === 'win32') {
-    const psLines = [
-      `$env:ANTHROPIC_BASE_URL=${quoteForPowerShell(sessionEnv.ANTHROPIC_BASE_URL)}`,
-      `$env:CLAUDE_CODE_MODEL=${quoteForPowerShell(sessionEnv.CLAUDE_CODE_MODEL)}`,
-      `$env:NODE_TLS_REJECT_UNAUTHORIZED=${quoteForPowerShell(sessionEnv.NODE_TLS_REJECT_UNAUTHORIZED)}`,
-      ...(sessionEnv.ANTHROPIC_API_KEY ? [`$env:ANTHROPIC_API_KEY=${quoteForPowerShell(sessionEnv.ANTHROPIC_API_KEY)}`] : []),
-      `Set-Location -Path ${quoteForPowerShell(config.cwd)}`,
-      ...banner.filter(Boolean).map((line) => `Write-Host ${quoteForPowerShell(line)}`),
-      `& ${quoteForPowerShell(claudeExec)}${buildClaudeCliArgs(config)}`
+    const cmdExecutable = process.env.ComSpec || 'cmd.exe';
+    const envSetupCommands = [
+      `set "ANTHROPIC_BASE_URL=${escapeForCmdValue(sessionEnv.ANTHROPIC_BASE_URL)}"`,
+      `set "CLAUDE_CODE_MODEL=${escapeForCmdValue(sessionEnv.CLAUDE_CODE_MODEL)}"`,
+      `set "NODE_TLS_REJECT_UNAUTHORIZED=${escapeForCmdValue(sessionEnv.NODE_TLS_REJECT_UNAUTHORIZED)}"`,
+      ...(sessionEnv.ANTHROPIC_API_KEY ? [`set "ANTHROPIC_API_KEY=${escapeForCmdValue(sessionEnv.ANTHROPIC_API_KEY)}"`] : [])
     ];
-
-    const powershellArgs = ['-NoExit', '-ExecutionPolicy', 'Bypass', '-Command', psLines.join('; ')];
-    const child = spawn('powershell.exe', powershellArgs, {
+    const bannerCommands = banner.filter(Boolean).map((line) => `echo ${quoteForCmd(line)}`);
+    const nativeCommand = [
+      'title Claude Code WebUI',
+      ...envSetupCommands,
+      ...bannerCommands,
+      `${quoteForCmd(claudeExec)}${buildClaudeCliArgs(config)}`
+    ].join(' && ');
+    const powerShellExecutable = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const startCommand = `Start-Process -FilePath ${quoteForPowerShell(cmdExecutable)} -WorkingDirectory ${quoteForPowerShell(config.cwd)} -WindowStyle Normal -ArgumentList @('/d','/k',${quoteForPowerShell(nativeCommand)})`;
+    const child = spawn(powerShellExecutable, [
+      '-NoProfile',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-Command',
+      startCommand
+    ], {
       detached: true,
       stdio: 'ignore',
-      windowsHide: false
+      windowsHide: true,
+      cwd: config.cwd,
+      env: buildPtyEnv(sessionEnv)
     });
 
     child.on('error', (err) => {
@@ -570,54 +744,8 @@ app.post('/v1/fs/mkdir', async (req, res) => {
 });
 
 // --- Protocol Bridge: Anthropic -> OpenAI ---
-app.get('/v1/models', async (req, res) => {
-  const config = loadConfig();
-  const provider = config.provider || 'anthropic';
-  const targetUrl = config.baseUrl || 'http://localhost:11434/v1';
-
-  console.log(`[Bridge] Fetching models for ${provider} from ${targetUrl}`);
-
-  if (provider === 'anthropic') {
-    return res.json({
-      models: [
-        { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet' },
-        { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku' },
-        { id: 'claude-3-opus-20240229', name: 'Claude 3 Opus' },
-        { id: 'claude-3-sonnet-20240229', name: 'Claude 3 Sonnet' },
-        { id: 'claude-3-haiku-20240307', name: 'Claude 3 Haiku' }
-      ]
-    });
-  }
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-
-    let url = '';
-    if (provider === 'ollama') {
-      const base = targetUrl.replace('/v1', '');
-      url = `${base}/api/tags`;
-      const response = await fetch(url, { signal: controller.signal });
-      clearTimeout(timeout);
-      const data = await response.json();
-      const models = data.models.map(m => ({ id: m.name, name: m.name }));
-      return res.json({ models });
-    } else {
-      url = `${targetUrl}/models`;
-      const response = await fetch(url, {
-        headers: { 'Authorization': `Bearer ${config.apiKey || 'dummy'}` },
-        signal: controller.signal
-      });
-      clearTimeout(timeout);
-      const data = await response.json();
-      const models = data.data.map(m => ({ id: m.id, name: m.id }));
-      return res.json({ models });
-    }
-  } catch (err) {
-    console.error('[Models Fetch Error]', err);
-    res.status(500).json({ error: err.name === 'AbortError' ? 'Request timed out' : err.message });
-  }
-});
+app.get('/v1/models', handleModelsRequest);
+app.post('/v1/models', handleModelsRequest);
 
 app.post('/v1/messages', async (req, res) => {
   const config = loadConfig();

@@ -75,8 +75,8 @@ ensure_node_and_npm() {
             fi
             ;;
         MINGW*|MSYS*|CYGWIN*)
-            echo "Automatic Node.js/npm install is not handled in this shell on Windows."
-            echo "Install Node.js from https://nodejs.org and re-run this script."
+            echo "Use install.ps1 from PowerShell for Windows setup."
+            echo "Example: powershell -ExecutionPolicy Bypass -File .\\install.ps1"
             exit 1
             ;;
         *)
@@ -157,7 +157,7 @@ ensure_local_runtime_files() {
 
     if [ ! -f server/cert.pem ] || [ ! -f server/key.pem ]; then
         echo "Generating local TLS certs..."
-        (cd server && ./generate-certs.sh)
+        npm --prefix server run generate:certs
     fi
 }
 

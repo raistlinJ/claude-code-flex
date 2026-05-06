@@ -1,10 +1,8 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Create server directory if it doesn't exist
-mkdir -p "$(dirname "$0")"
+set -euo pipefail
 
-echo "Generating self-signed SSL certificates..."
-openssl req -x509 -newkey rsa:4096 -keyout "$(dirname "$0")/key.pem" -out "$(dirname "$0")/cert.pem" -days 365 -nodes -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
-echo "Certificates generated successfully:"
-ls -l "$(dirname "$0")/key.pem" "$(dirname "$0")/cert.pem"
+node ./scripts/generate-certs.mjs

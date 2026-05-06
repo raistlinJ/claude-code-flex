@@ -13,9 +13,7 @@ npm run install:all
 2. Generate local TLS certs:
 
 ```bash
-cd server
-./generate-certs.sh
-cd ..
+npm --prefix server run generate:certs
 ```
 
 3. Run the app:

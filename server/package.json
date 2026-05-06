@@ -5,6 +5,7 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
+    "generate:certs": "node ./scripts/generate-certs.mjs",
     "fix:pty-perms": "node ./scripts/fix-node-pty-perms.mjs",
     "postinstall": "node ./scripts/fix-node-pty-perms.mjs",
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -17,6 +18,7 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "node-pty": "^1.1.0",
+    "selfsigned": "^3.0.1",
     "socket.io": "^4.8.3"
   }
 }
