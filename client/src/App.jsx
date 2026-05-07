@@ -262,7 +262,8 @@ const App = () => {
       }
 
       setNativeLaunchState('success');
-      setNativeLaunchMessage('Native terminal launch requested. If no window appears, check the backend log for a Windows spawn error.');
+      const launcherDetails = payload?.launcher ? ` via ${payload.launcher}` : '';
+      setNativeLaunchMessage(`Native terminal launch requested${launcherDetails}. If no window appears, check the backend log for a Windows spawn error.`);
     } catch (err) {
       setNativeLaunchState('error');
       setNativeLaunchMessage(err.message || 'Native terminal launch failed.');

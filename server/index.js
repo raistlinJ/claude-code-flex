@@ -4,7 +4,7 @@ import { Server } from 'socket.io';
 import os from 'os';
 import pty from 'node-pty';
 import cors from 'cors';
-import { spawn, exec } from 'child_process';
+import { spawn, spawnSync, exec } from 'child_process';
 import fs from 'fs';
 import { promises as fsPromises } from 'fs';
 import path from 'path';
@@ -274,7 +274,6 @@ const getClaudeExecutable = (config = {}) => {
 
 const quoteForBash = (value) => `'${String(value).replace(/'/g, `'"'"'`)}'`;
 const quoteForCmd = (value) => `"${String(value).replace(/"/g, '""')}"`;
-const quoteForPowerShell = (value) => `'${String(value).replace(/'/g, "''")}'`;
 const escapeForCmdValue = (value) => String(value).replace(/%/g, '%%').replace(/"/g, '""');
 const quoteForInteractiveShell = (value) => {
   const text = String(value);
@@ -612,6 +611,9 @@ app.post('/v1/terminal/launch', (req, res) => {
 
   if (process.platform === 'win32') {
     const cmdExecutable = process.env.ComSpec || 'cmd.exe';
+    const launchCwd = fs.existsSync(config.cwd)
+      ? path.win32.normalize(path.resolve(config.cwd))
+      : path.win32.normalize(process.cwd());
     const envSetupCommands = [
       `set "ANTHROPIC_BASE_URL=${escapeForCmdValue(sessionEnv.ANTHROPIC_BASE_URL)}"`,
       `set "CLAUDE_CODE_MODEL=${escapeForCmdValue(sessionEnv.CLAUDE_CODE_MODEL)}"`,
@@ -625,31 +627,71 @@ app.post('/v1/terminal/launch', (req, res) => {
       ...bannerCommands,
       `${quoteForCmd(claudeExec)}${buildClaudeCliArgs(config)}`
     ].join(' && ');
-    const powerShellExecutable = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-    const startCommand = `Start-Process -FilePath ${quoteForPowerShell(cmdExecutable)} -WorkingDirectory ${quoteForPowerShell(config.cwd)} -WindowStyle Normal -ArgumentList @('/d','/k',${quoteForPowerShell(nativeCommand)})`;
-    const child = spawn(powerShellExecutable, [
-      '-NoProfile',
-      '-ExecutionPolicy',
-      'Bypass',
-      '-Command',
-      startCommand
-    ], {
-      detached: true,
-      stdio: 'ignore',
+    const launchEnv = buildPtyEnv(sessionEnv);
+    const hasWindowsTerminal = spawnSync('where', ['wt.exe'], {
       windowsHide: true,
-      cwd: config.cwd,
-      env: buildPtyEnv(sessionEnv)
-    });
+      stdio: 'ignore',
+      shell: false
+    }).status === 0;
 
-    child.on('error', (err) => {
-      console.error('[Terminal Launch Error]', err);
-      if (!res.headersSent) {
-        res.status(500).json({ error: err.message });
-      }
-    });
+    const launchViaCmdStart = () => {
+      const startCommand = `start "Claude Code WebUI" /d ${quoteForCmd(launchCwd)} ${quoteForCmd(cmdExecutable)} /d /k ${quoteForCmd(nativeCommand)}`;
+      const startArguments = ['/d', '/s', '/c', startCommand];
 
-    child.unref();
-    res.json({ success: true });
+      console.log('[Native Terminal] Launching Windows terminal via cmd start', {
+        cmdExecutable,
+        cwd: launchCwd,
+        claudeExec,
+        startCommand,
+        startArguments
+      });
+
+      const child = spawn(cmdExecutable, startArguments, {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false,
+        cwd: launchCwd,
+        env: launchEnv,
+        windowsVerbatimArguments: true
+      });
+
+      child.on('error', (err) => {
+        console.error('[Terminal Launch Error]', err);
+      });
+
+      child.unref();
+    };
+    let launcherUsed = 'cmd-start';
+
+    if (hasWindowsTerminal) {
+      const wtArgs = ['-d', launchCwd, 'cmd.exe', '/d', '/k', nativeCommand];
+      console.log('[Native Terminal] Launching Windows terminal via wt.exe', {
+        cwd: launchCwd,
+        claudeExec,
+        wtArgs
+      });
+
+      const wtChild = spawn('wt.exe', wtArgs, {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false,
+        cwd: launchCwd,
+        env: launchEnv
+      });
+
+      wtChild.on('error', (err) => {
+        console.warn('[Native Terminal] wt.exe launch failed, falling back to cmd start', err);
+        launcherUsed = 'cmd-start-fallback';
+        launchViaCmdStart();
+      });
+
+      wtChild.unref();
+      launcherUsed = 'wt';
+    } else {
+      launchViaCmdStart();
+    }
+
+    res.json({ success: true, launcher: launcherUsed, serverPort: PORT });
     return;
   }
 
@@ -922,6 +964,16 @@ app.post('/v1/messages', async (req, res) => {
     console.error('[Bridge Error]', err);
     res.status(500).json({ error: { message: err.message } });
   }
+});
+
+httpServer.on('error', (err) => {
+  if (err?.code === 'EADDRINUSE') {
+    console.warn(`[Server] Port ${PORT} is already in use. Keeping existing backend process and skipping duplicate start.`);
+    return;
+  }
+
+  console.error('[Server] Failed to start HTTPS server:', err);
+  process.exit(1);
 });
 
 httpServer.listen(PORT, () => {
