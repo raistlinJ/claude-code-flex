@@ -240,6 +240,7 @@ const buildSessionBanner = (config, sessionEnv) => {
     `[Session] auth_mode=${authMode}`,
     `[Session] api_key_set=${sessionEnv.ANTHROPIC_API_KEY ? 'yes' : 'no'}`,
     `[Session] bypass_permissions=${config.allowBypassPermissions ? 'on' : 'off'}`,
+    `[Session] auto_approve_implementation=${config.autoApproveImplementation ? 'on' : 'off'}`,
     `[Session] claude_exec=${getClaudeExecutable(config)}`,
     `[Session] pty_backend=${nodePtyStatus.available ? 'node-pty' : 'python-fallback'}`,
     ...(nodePtyStatus.available ? [] : [`[Session] pty_reason=${nodePtyStatus.reason}`]),
@@ -254,7 +255,10 @@ const buildClaudeCliArgs = (config) => {
   const bypassArg = config.allowBypassPermissions
     ? ' --dangerously-skip-permissions'
     : '';
-  return `${modelArg}${bypassArg}`;
+  const autoApproveArg = config.autoApproveImplementation
+    ? ' --permission-mode auto'
+    : '';
+  return `${modelArg}${bypassArg}${autoApproveArg}`;
 };
 
 const getClaudeExecutable = (config = {}) => {
@@ -290,7 +294,8 @@ const DEFAULT_SESSION_CONFIG = {
   provider: 'anthropic',
   cwd: process.cwd(),
   autoStart: true,
-  allowBypassPermissions: false
+  allowBypassPermissions: false,
+  autoApproveImplementation: false
 };
 
 const normalizeStoredConfig = (config = {}) => ({
@@ -303,7 +308,8 @@ const normalizeStoredConfig = (config = {}) => ({
     ? config.cwd
     : DEFAULT_SESSION_CONFIG.cwd,
   autoStart: true,
-  allowBypassPermissions: config.allowBypassPermissions ?? DEFAULT_SESSION_CONFIG.allowBypassPermissions
+  allowBypassPermissions: config.allowBypassPermissions ?? DEFAULT_SESSION_CONFIG.allowBypassPermissions,
+  autoApproveImplementation: config.autoApproveImplementation ?? DEFAULT_SESSION_CONFIG.autoApproveImplementation
 });
 
 const preferLaunchString = (incomingValue, savedValue, fallback = '') => {
@@ -341,7 +347,8 @@ const buildLaunchConfig = (incomingConfig = {}) => {
     model: preferLaunchString(incomingConfig.model, savedConfig.model, ''),
     cwd: preferLaunchString(incomingConfig.cwd, savedConfig.cwd, DEFAULT_SESSION_CONFIG.cwd),
     autoStart: true,
-    allowBypassPermissions: incomingConfig.allowBypassPermissions ?? savedConfig.allowBypassPermissions
+    allowBypassPermissions: incomingConfig.allowBypassPermissions ?? savedConfig.allowBypassPermissions,
+    autoApproveImplementation: incomingConfig.autoApproveImplementation ?? savedConfig.autoApproveImplementation
   });
 };
 
@@ -507,11 +514,10 @@ io.on('connection', (socket) => {
 });
 
 const handleModelsRequest = async (req, res) => {
-  const config = req.method === 'POST'
-    ? normalizeStoredConfig(req.body || {})
-    : loadConfig();
-  const provider = config.provider || 'anthropic';
-  const targetUrl = config.baseUrl || 'http://localhost:11434/v1';
+  const config = loadConfig();
+  const provider = req.query.provider || req.body?.provider || config.provider || 'anthropic';
+  const targetUrl = req.query.baseUrl || req.body?.baseUrl || config.baseUrl || (provider === 'ollama' ? 'http://localhost:11434/v1' : '');
+  const apiKey = req.query.apiKey || req.body?.apiKey || config.apiKey;
 
   console.log(`[Bridge] Fetching models for ${provider} from ${targetUrl}`);
 
@@ -544,7 +550,7 @@ const handleModelsRequest = async (req, res) => {
 
     url = `${targetUrl}/models`;
     const response = await fetch(url, {
-      headers: { 'Authorization': `Bearer ${config.apiKey || 'dummy'}` },
+      headers: { 'Authorization': `Bearer ${apiKey || 'dummy'}` },
       signal: controller.signal
     });
     clearTimeout(timeout);
@@ -587,6 +593,7 @@ app.post('/v1/terminal/launch', (req, res) => {
     `[Session] auth_mode=${authMode}`,
     `[Session] api_key_set=${sessionEnv.ANTHROPIC_API_KEY ? 'yes' : 'no'}`,
     `[Session] bypass_permissions=${config.allowBypassPermissions ? 'on' : 'off'}`,
+    `[Session] auto_approve_implementation=${config.autoApproveImplementation ? 'on' : 'off'}`,
     ''
   ];
 

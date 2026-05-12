@@ -597,3 +597,14 @@ button.secondary:hover {
     font-size: 0.7rem;
   }
 }
+
+.error-box {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: rgba(218, 54, 51, 0.1);
+  border: 1px solid var(--danger-color);
+  border-radius: 6px;
+  color: var(--danger-color);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}

@@ -12,14 +12,16 @@ const DEFAULT_CONFIG = {
   provider: 'anthropic',
   cwd: '',
   autoStart: true,
-  allowBypassPermissions: false
+  allowBypassPermissions: false,
+  autoApproveImplementation: false
 };
 
 const normalizeConfig = (config = {}) => ({
   ...DEFAULT_CONFIG,
   ...config,
   autoStart: true,
-  allowBypassPermissions: config.allowBypassPermissions ?? DEFAULT_CONFIG.allowBypassPermissions
+  allowBypassPermissions: config.allowBypassPermissions ?? DEFAULT_CONFIG.allowBypassPermissions,
+  autoApproveImplementation: config.autoApproveImplementation ?? DEFAULT_CONFIG.autoApproveImplementation
 });
 
 const readStoredBoolean = (key, fallback) => {
@@ -35,7 +37,8 @@ const readStoredConfig = () => normalizeConfig({
   model: localStorage.getItem('claude_model') || '',
   provider: localStorage.getItem('claude_provider') || DEFAULT_CONFIG.provider,
   cwd: localStorage.getItem('claude_cwd') || '',
-  allowBypassPermissions: readStoredBoolean('allowBypassPermissions', DEFAULT_CONFIG.allowBypassPermissions)
+  allowBypassPermissions: readStoredBoolean('allowBypassPermissions', DEFAULT_CONFIG.allowBypassPermissions),
+  autoApproveImplementation: readStoredBoolean('autoApproveImplementation', DEFAULT_CONFIG.autoApproveImplementation)
 });
 
 const persistConfig = (config) => {
@@ -74,6 +77,7 @@ const App = () => {
 
   const [models, setModels] = useState([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [fetchError, setFetchError] = useState(null);
 
   useEffect(() => {
     configRef.current = config;
@@ -184,6 +188,7 @@ const App = () => {
     if (isSessionActive) return;
     const activeConfig = normalizeConfig(configOverride);
     setIsFetchingModels(true);
+    setFetchError(null);
     try {
       const response = await fetch('/v1/models', {
         method: 'POST',
@@ -191,7 +196,12 @@ const App = () => {
         body: JSON.stringify(activeConfig)
       });
       const data = await response.json();
-      if (data.models?.length) {
+      
+      if (!response.ok || data.error) {
+        throw new Error(data.error || `Server returned ${response.status}`);
+      }
+
+      if (data.models) {
         setModels(data.models);
         // If current model is not in the list, select the first one
         if (!activeConfig.model || !data.models.find(m => m.id === activeConfig.model)) {
@@ -200,6 +210,7 @@ const App = () => {
       }
     } catch (err) {
       console.error('Error fetching models:', err);
+      setFetchError(err.message || 'Failed to fetch models');
     } finally {
       setIsFetchingModels(false);
     }
@@ -213,11 +224,11 @@ const App = () => {
     if (key === 'provider') {
       setModels([]);
       if (value === 'ollama') {
-        newConfig.baseUrl = 'http://localhost:11434/v1';
+        if (!newConfig.baseUrl) newConfig.baseUrl = 'http://localhost:11434/v1';
         // Don't auto-set model here, let them fetch
         newConfig.model = ''; 
       } else if (value === 'anthropic') {
-        newConfig.baseUrl = '';
+        if (newConfig.baseUrl === 'http://localhost:11434/v1') newConfig.baseUrl = '';
       }
     }
 
@@ -446,6 +457,11 @@ const App = () => {
               ))
             )}
           </select>
+          {fetchError && (
+            <div className="error-box fade-in">
+              {fetchError}
+            </div>
+          )}
         </div>
 
         <div className="form-group">
@@ -490,6 +506,24 @@ const App = () => {
           </div>
           <p style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: 4 }}>
             Disabled by default. Enable only for trusted local workflows.
+          </p>
+        </div>
+
+        <div className="form-group">
+          <div className="toggle-row">
+            <span className="toggle-label">Auto-approve Implementation</span>
+            <label className="switch" aria-label="Auto-approve Implementation">
+              <input
+                type="checkbox"
+                checked={!!config.autoApproveImplementation}
+                onChange={(e) => saveConfig('autoApproveImplementation', e.target.checked)}
+                disabled={isConfigLocked}
+              />
+              <span className="slider" />
+            </label>
+          </div>
+          <p style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: 4 }}>
+            Enable "Auto Mode" to automatically handle permission prompts.
           </p>
         </div>
 
