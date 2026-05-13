@@ -24,6 +24,27 @@ const normalizeConfig = (config = {}) => ({
   autoApproveImplementation: config.autoApproveImplementation ?? DEFAULT_CONFIG.autoApproveImplementation
 });
 
+const getCircularReplacer = () => {
+  const seen = new WeakSet();
+  return (key, value) => {
+    if (typeof value === "object" && value !== null) {
+      if (seen.has(value)) {
+        return "[Circular]";
+      }
+      seen.add(value);
+    }
+    return value;
+  };
+};
+
+const safeJsonStringify = (obj, indent = 2) => {
+  try {
+    return JSON.stringify(obj, null, indent);
+  } catch (err) {
+    return JSON.stringify(obj, getCircularReplacer(), indent);
+  }
+};
+
 const readStoredBoolean = (key, fallback) => {
   const rawValue = localStorage.getItem(`claude_${key}`);
   if (rawValue === null) return fallback;
@@ -184,16 +205,20 @@ const App = () => {
     };
   }, [isResizingSidebar]);
 
-  const fetchModels = async (configOverride = configRef.current) => {
+  const fetchModels = async (configOverride) => {
     if (isSessionActive) return;
-    const activeConfig = normalizeConfig(configOverride);
+    // Guard: ignore non-config arguments (e.g. MouseEvent from onClick)
+    const baseConfig = (configOverride && typeof configOverride === 'object' && 'provider' in configOverride)
+      ? configOverride
+      : configRef.current;
+    const activeConfig = normalizeConfig(baseConfig);
     setIsFetchingModels(true);
     setFetchError(null);
     try {
       const response = await fetch('/v1/models', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(activeConfig)
+        body: safeJsonStringify(activeConfig)
       });
       const data = await response.json();
       
@@ -207,6 +232,11 @@ const App = () => {
         if (!activeConfig.model || !data.models.find(m => m.id === activeConfig.model)) {
           saveConfig('model', data.models[0].id);
         }
+      }
+
+      // Show auth warning if the server detected a bad API key via probe
+      if (data.authError) {
+        setFetchError(data.authError);
       }
     } catch (err) {
       console.error('Error fetching models:', err);
@@ -229,6 +259,9 @@ const App = () => {
         newConfig.model = ''; 
       } else if (value === 'anthropic') {
         if (newConfig.baseUrl === 'http://localhost:11434/v1') newConfig.baseUrl = '';
+      } else if (value === 'anthropic-compatible') {
+        // Clear model to force re-fetch from the remote server
+        newConfig.model = '';
       }
     }
 
@@ -240,7 +273,9 @@ const App = () => {
     // Save to server
     if (socket) {
       console.log('Sending config update to server:', persistedConfig);
-      socket.emit('update-config', persistedConfig);
+      // Ensure we don't send cyclic structures
+      const safeConfig = JSON.parse(safeJsonStringify(persistedConfig, 0));
+      socket.emit('update-config', safeConfig);
     }
   };
 
@@ -258,7 +293,7 @@ const App = () => {
       const response = await fetch('/v1/terminal/launch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(launchConfig)
+        body: safeJsonStringify(launchConfig)
       });
 
       let payload = null;
@@ -287,7 +322,8 @@ const App = () => {
       const sessionConfig = normalizeConfig(configRef.current);
       setSessionResetKey(prev => prev + 1);
       setTerminalHistory('');
-      socket.emit('start-session', sessionConfig);
+      const safeSessionConfig = JSON.parse(safeJsonStringify(sessionConfig, 0));
+      socket.emit('start-session', safeSessionConfig);
       setIsSessionActive(true);
       setMobileActiveTab('terminal');
     }
@@ -315,6 +351,13 @@ const App = () => {
           urlLabel: 'API Base URL',
           modelLabel: 'Model Name',
           urlPlaceholder: 'https://api.openai.com/v1'
+        };
+      case 'anthropic-compatible':
+        return {
+          apiLabel: 'API Key',
+          urlLabel: 'Server Base URL',
+          modelLabel: 'Model Name',
+          urlPlaceholder: 'https://your-server.example.com:10101/v1'
         };
       default:
         return {
@@ -380,13 +423,16 @@ const App = () => {
             disabled={isConfigLocked}
           >
             <option value="anthropic">Anthropic Claude</option>
+            <option value="anthropic-compatible">Anthropic-Compatible (Direct)</option>
             <option value="ollama">Ollama</option>
-            <option value="openai-compatible">OpenAI Compatible</option>
+            <option value="openai-compatible">OpenAI Compatible (Bridge)</option>
           </select>
           <p style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: 4 }}>
             {config.provider === 'anthropic'
               ? 'Anthropic mode requires Claude login or an API key.'
-              : 'Bridge mode can run without Claude login when provider API key is optional.'}
+              : config.provider === 'anthropic-compatible'
+                ? 'Direct mode — your server speaks native Anthropic API. No proxy translation.'
+                : 'Bridge mode can run without Claude login when provider API key is optional.'}
           </p>
         </div>
 
@@ -437,7 +483,7 @@ const App = () => {
             <button 
               className="btn btn-secondary" 
               style={{ padding: '2px 8px', fontSize: '0.7rem' }}
-              onClick={fetchModels}
+              onClick={() => fetchModels()}
               disabled={isFetchingModels || isConfigLocked || !hasLoadedConfig}
             >
               {isFetchingModels ? 'Fetching...' : 'Fetch Models'}
@@ -509,21 +555,23 @@ const App = () => {
           </p>
         </div>
 
-        <div className="form-group">
+        <div className="form-group" style={{ opacity: config.allowBypassPermissions ? 0.5 : 1 }}>
           <div className="toggle-row">
             <span className="toggle-label">Auto-approve Implementation</span>
             <label className="switch" aria-label="Auto-approve Implementation">
               <input
                 type="checkbox"
-                checked={!!config.autoApproveImplementation}
+                checked={!!config.allowBypassPermissions || !!config.autoApproveImplementation}
                 onChange={(e) => saveConfig('autoApproveImplementation', e.target.checked)}
-                disabled={isConfigLocked}
+                disabled={isConfigLocked || !!config.allowBypassPermissions}
               />
               <span className="slider" />
             </label>
           </div>
           <p style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: 4 }}>
-            Enable "Auto Mode" to automatically handle permission prompts.
+            {config.allowBypassPermissions
+              ? 'Already covered by Bypass Permissions above.'
+              : 'Enable "Auto Mode" to automatically handle permission prompts.'}
           </p>
         </div>
 

@@ -223,27 +223,45 @@ const ensureNodePtyHelperPermissions = () => {
 const buildClaudeSessionEnv = (config) => {
   const provider = config.provider || 'anthropic';
   const baseUrl = config.baseUrl || '';
+
+  // Determine ANTHROPIC_BASE_URL based on provider:
+  // - anthropic: use configured baseUrl or default Anthropic API
+  // - anthropic-compatible: point DIRECTLY at the remote server (no proxy translation)
+  // - ollama/openai-compatible: route through local proxy bridge for format translation
+  let anthropicBaseUrl;
+  if (provider === 'anthropic-compatible') {
+    // Direct passthrough — the remote server speaks native Anthropic Messages API.
+    // Strip trailing /v1 if present since Claude Code adds it internally.
+    anthropicBaseUrl = baseUrl.replace(/\/v1\/?$/, '') || 'https://api.anthropic.com';
+  } else if (provider === 'ollama' || provider === 'openai-compatible') {
+    anthropicBaseUrl = `https://localhost:${PORT}`;
+  } else {
+    anthropicBaseUrl = baseUrl || 'https://api.anthropic.com';
+  }
+
   const sessionEnv = {
     ...process.env,
-    ANTHROPIC_BASE_URL: (provider === 'ollama' || provider === 'openai-compatible')
-      ? `https://localhost:${PORT}`
-      : (baseUrl || 'https://api.anthropic.com'),
+    ANTHROPIC_BASE_URL: anthropicBaseUrl,
     CLAUDE_CODE_MODEL: config.model || '',
     NODE_TLS_REJECT_UNAUTHORIZED: '0'
   };
 
   // Auth behavior is provider-aware:
   // - anthropic: preserve normal Claude auth flow (OAuth/session or explicit key)
+  // - anthropic-compatible: use the user's real API key directly (server authenticates natively)
   // - ollama/openai-compatible: provide a placeholder key when none is set so Claude does not require /login
   const explicitApiKey = config.apiKey && String(config.apiKey).trim()
     ? String(config.apiKey).trim()
     : '';
 
-  if (provider === 'anthropic' && explicitApiKey) {
+  if ((provider === 'anthropic' || provider === 'anthropic-compatible') && explicitApiKey) {
     sessionEnv.ANTHROPIC_API_KEY = explicitApiKey;
-  } else if (provider !== 'anthropic') {
+  } else if (provider !== 'anthropic' && provider !== 'anthropic-compatible') {
     // Bridge providers authenticate upstream in the local backend, so Claude only
     // needs a stable placeholder key here to bypass interactive login prompts.
+    sessionEnv.ANTHROPIC_API_KEY = 'local-provider-key';
+  } else if (provider === 'anthropic-compatible' && !explicitApiKey) {
+    // anthropic-compatible without a key: provide a placeholder to skip login
     sessionEnv.ANTHROPIC_API_KEY = 'local-provider-key';
   } else {
     delete sessionEnv.ANTHROPIC_API_KEY;
@@ -281,7 +299,9 @@ const buildClaudeCliArgs = (config) => {
   const bypassArg = config.allowBypassPermissions
     ? ' --dangerously-skip-permissions'
     : '';
-  const autoApproveArg = config.autoApproveImplementation
+  // --dangerously-skip-permissions already implies full bypass, so skip --permission-mode auto
+  // when bypass is enabled to avoid conflicting CLI flags.
+  const autoApproveArg = (config.autoApproveImplementation && !config.allowBypassPermissions)
     ? ' --permission-mode auto'
     : '';
   return `${modelArg}${bypassArg}${autoApproveArg}`;
@@ -557,6 +577,47 @@ const handleModelsRequest = async (req, res) => {
         { id: 'claude-3-haiku-20240307', name: 'Claude 3 Haiku' }
       ]
     });
+  }
+
+  // anthropic-compatible: fetch models from the remote server's /v1/models endpoint
+  if (provider === 'anthropic-compatible') {
+    if (!targetUrl) {
+      return res.status(400).json({ error: 'Server Base URL is required for Anthropic-Compatible provider.' });
+    }
+    try {
+      const modelsUrl = `${targetUrl}/models`;
+      console.log(`[Bridge] anthropic-compatible: fetching ${modelsUrl}`);
+      const headers = {};
+      if (apiKey) headers['x-api-key'] = apiKey;
+      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+      const response = await fetch(modelsUrl, { headers, signal: controller.signal });
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => 'No error body');
+        return res.status(response.status).json({
+          error: `Server returned HTTP ${response.status}. ${errorText}`
+        });
+      }
+
+      const data = await response.json();
+      // Handle both OpenAI-style { data: [...] } and Ollama-style { models: [...] }
+      const modelsData = data.data || data.models || [];
+      const models = modelsData.map(m => ({ id: m.id || m.name || m.model, name: m.id || m.name || m.model }));
+      return res.json({ models: JSON.parse(safeJsonStringify(models, 0)) });
+    } catch (err) {
+      console.error('[Models Fetch Error] anthropic-compatible:', err);
+      let message = err.message;
+      const causeCode = err.cause?.code || err.code;
+      if (err.name === 'AbortError') message = `Request timed out after 15s. Check that ${targetUrl} is reachable.`;
+      else if (causeCode === 'ECONNREFUSED') message = `Connection refused. Is the server at ${targetUrl} running?`;
+      else if (causeCode === 'ECONNRESET') message = 'Connection reset. The server may require a different protocol (http vs https).';
+      else if (causeCode === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' || causeCode === 'DEPTH_ZERO_SELF_SIGNED_CERT') message = 'SSL certificate error. Server may be using a self-signed certificate.';
+      return res.status(500).json({ error: message });
+    }
   }
 
   try {
