@@ -14,6 +14,31 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const PORT = process.env.PORT || 3001;
+
+// Allow self-signed certificates for local provider bridges
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
+// Helper to handle cyclic structures during JSON.stringify
+const getCircularReplacer = () => {
+  const seen = new WeakSet();
+  return (key, value) => {
+    if (typeof value === "object" && value !== null) {
+      if (seen.has(value)) {
+        return "[Circular]";
+      }
+      seen.add(value);
+    }
+    return value;
+  };
+};
+
+const safeJsonStringify = (obj, indent = 2) => {
+  try {
+    return JSON.stringify(obj, null, indent);
+  } catch (err) {
+    return JSON.stringify(obj, getCircularReplacer(), indent);
+  }
+};
 const NODE_PTY_HELPER_PATH = path.join(__dirname, 'node_modules', 'node-pty', 'prebuilds', `darwin-${process.arch}`, 'spawn-helper');
 
 const app = express();
@@ -148,10 +173,11 @@ const broadcastTerminalData = (data) => {
 };
 
 const emitSessionState = (socket) => {
-  socket.emit('session-state', {
+  const state = {
     active: !!activePtyProcess,
     config: activeSessionConfig
-  });
+  };
+  socket.emit('session-state', JSON.parse(safeJsonStringify(state, 0)));
 };
 
 const clearActiveSession = (exitCode = 0, signal = 'session-closed') => {
@@ -331,7 +357,7 @@ const loadConfig = () => {
 
 const saveConfig = (config) => {
   try {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(normalizeStoredConfig(config), null, 2));
+    fs.writeFileSync(CONFIG_PATH, safeJsonStringify(normalizeStoredConfig(config), 2));
   } catch (err) {
     console.error('Error saving config:', err);
   }
@@ -357,7 +383,7 @@ io.on('connection', (socket) => {
 
   // Send current config to client
   const initialConfig = loadConfig();
-  socket.emit('config-loaded', initialConfig);
+  socket.emit('config-loaded', JSON.parse(safeJsonStringify(initialConfig, 0)));
   emitSessionState(socket);
   if (activePtyProcess && terminalHistory) {
     socket.emit('terminal-history', terminalHistory);
@@ -388,7 +414,7 @@ io.on('connection', (socket) => {
         ]
       : getShellCandidates();
     broadcastTerminalData(`\r\n${buildSessionBanner(config, sessionEnv)}\r\n`);
-    io.emit('session-state', { active: true, config: activeSessionConfig });
+    io.emit('session-state', JSON.parse(safeJsonStringify({ active: true, config: activeSessionConfig }, 0)));
 
     const spawnWithFallback = (shells, currentEnv) => {
       if (shells.length === 0) {
@@ -535,31 +561,105 @@ const handleModelsRequest = async (req, res) => {
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
+    const timeout = setTimeout(() => controller.abort(), 10000);
 
     let url = '';
     if (provider === 'ollama') {
       const base = targetUrl.replace('/v1', '');
       url = `${base}/api/tags`;
-      const response = await fetch(url, { signal: controller.signal });
+      const headers = {};
+      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+      const response = await fetch(url, { headers, signal: controller.signal });
       clearTimeout(timeout);
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => 'No error body');
+        console.error(`[Models Fetch Error] Ollama returned ${response.status}: ${errorText}`);
+        return res.status(response.status).json({
+          error: `Server returned HTTP ${response.status}. ${errorText || 'Check your URL and credentials.'}`
+        });
+      }
+
       const data = await response.json();
-      const models = data.models.map(m => ({ id: m.name, name: m.name }));
+      const models = (data.models || []).map(m => ({ id: m.name, name: m.name }));
       return res.json({ models });
     }
 
+    // --- OpenAI-compatible provider ---
     url = `${targetUrl}/models`;
+    const authHeaders = { 'Authorization': `Bearer ${apiKey || 'dummy'}` };
     const response = await fetch(url, {
-      headers: { 'Authorization': `Bearer ${apiKey || 'dummy'}` },
+      headers: authHeaders,
       signal: controller.signal
     });
     clearTimeout(timeout);
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => 'No error body');
+      console.error(`[Models Fetch Error] Provider returned ${response.status}: ${errorText}`);
+      return res.status(response.status).json({
+        error: `Server returned HTTP ${response.status}. ${errorText || 'Check your URL and credentials.'}`
+      });
+    }
+
     const data = await response.json();
-    const models = data.data.map(m => ({ id: m.id, name: m.id }));
-    return res.json({ models });
+    if (!data || (!data.data && !data.models)) {
+      console.error('[Models Fetch Error] Invalid response format:', data);
+      return res.status(500).json({ error: 'Invalid response format from provider. Is this an OpenAI-compatible endpoint?' });
+    }
+
+    const modelsData = data.data || data.models || [];
+    const models = modelsData.map(m => ({ id: m.id || m.name, name: m.id || m.name }));
+
+    // --- API Key Validation Probe ---
+    // Some servers (e.g. llama.cpp) don't enforce auth on /models but do on /chat/completions.
+    // Send a minimal request to verify the API key actually works before the user starts a session.
+    if (apiKey && models.length > 0) {
+      try {
+        const probeController = new AbortController();
+        const probeTimeout = setTimeout(() => probeController.abort(), 8000);
+        const probeModel = models[0].id;
+        console.log(`[Bridge] Validating API key against ${targetUrl}/chat/completions with model ${probeModel}`);
+
+        const probeResponse = await fetch(`${targetUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+          },
+          body: safeJsonStringify({
+            model: probeModel,
+            messages: [{ role: 'user', content: 'Hi' }],
+            max_tokens: 1
+          }),
+          signal: probeController.signal
+        });
+        clearTimeout(probeTimeout);
+
+        if (probeResponse.status === 401 || probeResponse.status === 403) {
+          const probeError = await probeResponse.text().catch(() => '');
+          console.error(`[Bridge] API key validation failed (${probeResponse.status}): ${probeError}`);
+          return res.json({
+            models: JSON.parse(safeJsonStringify(models, 0)),
+            authError: `API key rejected: The server returned HTTP ${probeResponse.status} on a test request. Your key may be invalid.`
+          });
+        }
+        console.log(`[Bridge] API key validation passed (HTTP ${probeResponse.status})`);
+      } catch (probeErr) {
+        // Probe failed for non-auth reasons (timeout, network) – don't block model listing
+        console.warn(`[Bridge] API key probe failed (non-auth): ${probeErr.message}`);
+      }
+    }
+
+    return res.json({ models: JSON.parse(safeJsonStringify(models, 0)) });
   } catch (err) {
     console.error('[Models Fetch Error]', err);
-    res.status(500).json({ error: err.name === 'AbortError' ? 'Request timed out' : err.message });
+    let message = err.message;
+    const causeCode = err.cause?.code || err.code;
+    if (causeCode === 'ECONNRESET') message = 'Connection reset by remote host. The server may require HTTPS — check your Base URL protocol.';
+    if (causeCode === 'ECONNREFUSED') message = 'Connection refused. Check if the remote server is running and accessible.';
+    if (causeCode === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' || causeCode === 'DEPTH_ZERO_SELF_SIGNED_CERT') message = 'SSL certificate verification failed. The server may be using a self-signed certificate.';
+    res.status(500).json({ error: err.name === 'AbortError' ? 'Request timed out after 10s. Check that the URL is reachable.' : message });
   }
 };
 
@@ -819,20 +919,65 @@ app.post('/v1/messages', async (req, res) => {
     openaiMessages.push({ role: 'system', content: system });
   }
   
-    messages.forEach(msg => {
-      let content = msg.content;
-      if (Array.isArray(content)) {
-        content = content.map(block => {
-          if (block.type === 'text') return block.text;
-          if (block.type === 'tool_use') return `[Tool Use: ${block.name}]`;
-          if (block.type === 'tool_result') return `[Tool Result: ${block.content}]`;
-          return '';
-        }).join('\n');
+  messages.forEach(msg => {
+    if (typeof msg.content === 'string') {
+      openaiMessages.push({ role: msg.role, content: msg.content });
+      return;
+    }
+    
+    if (Array.isArray(msg.content)) {
+      if (msg.role === 'user' && msg.content.some(b => b.type === 'tool_result')) {
+        let textParts = msg.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+        if (textParts) {
+          openaiMessages.push({ role: 'user', content: textParts });
+        }
+        msg.content.filter(b => b.type === 'tool_result').forEach(block => {
+          let toolContent = block.content;
+          if (Array.isArray(toolContent)) {
+             toolContent = toolContent.map(c => typeof c === 'string' ? c : (c.text || JSON.stringify(c))).join('\n');
+          } else if (typeof toolContent !== 'string') {
+             toolContent = JSON.stringify(toolContent);
+          }
+          openaiMessages.push({
+            role: 'tool',
+            tool_call_id: block.tool_use_id,
+            content: toolContent
+          });
+        });
+        return;
       }
-      openaiMessages.push({ role: msg.role, content });
-    });
 
-    console.log('[Bridge] Formatted OpenAI Messages:', JSON.stringify(openaiMessages, null, 2));
+      if (msg.role === 'assistant') {
+        let textParts = msg.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+        let toolUses = msg.content.filter(b => b.type === 'tool_use');
+        
+        let assistantMsg = { role: 'assistant', content: textParts || null };
+        if (toolUses.length > 0) {
+          assistantMsg.tool_calls = toolUses.map(block => ({
+            id: block.id,
+            type: 'function',
+            function: {
+              name: block.name,
+              arguments: JSON.stringify(block.input || {})
+            }
+          }));
+        }
+        openaiMessages.push(assistantMsg);
+        return;
+      }
+
+      // Fallback
+      let contentStr = msg.content.map(block => {
+        if (block.type === 'text') return block.text;
+        if (block.type === 'tool_use') return `[Tool Use: ${block.name}]`;
+        if (block.type === 'tool_result') return `[Tool Result: ${block.content}]`;
+        return '';
+      }).join('\n');
+      openaiMessages.push({ role: msg.role, content: contentStr });
+    }
+  });
+
+  console.log('[Bridge] Formatted OpenAI Messages:', safeJsonStringify(openaiMessages, 2));
 
   // 2. Map tools
   const openaiTools = tools?.map(t => ({
@@ -854,7 +999,7 @@ app.post('/v1/messages', async (req, res) => {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${config.apiKey || 'dummy'}`
       },
-      body: JSON.stringify({
+      body: safeJsonStringify({
         model: effectiveModel,
         messages: openaiMessages,
         tools: openaiTools,
@@ -876,7 +1021,7 @@ app.post('/v1/messages', async (req, res) => {
       const decoder = new TextDecoder();
       
       // Send initial message_start in Anthropic-compatible shape.
-      res.write(`data: ${JSON.stringify({ type: 'message_start', message: { id: 'msg_' + Date.now(), type: 'message', role: 'assistant', content: [], model: model || config.model || 'unknown', stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } })}\n\n`);
+      res.write(`data: ${safeJsonStringify({ type: 'message_start', message: { id: 'msg_' + Date.now(), type: 'message', role: 'assistant', content: [], model: model || config.model || 'unknown', stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } })}\n\n`);
 
       let currentBlockType = null;
 
@@ -897,23 +1042,23 @@ app.post('/v1/messages', async (req, res) => {
               if (delta?.content) {
                 console.log(`[Bridge] Token: ${delta.content}`);
                 if (currentBlockType !== 'text') {
-                  if (currentBlockType) res.write(`data: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
-                  res.write(`data: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`);
+                  if (currentBlockType) res.write(`data: ${safeJsonStringify({ type: 'content_block_stop', index: 0 })}\n\n`);
+                  res.write(`data: ${safeJsonStringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`);
                   currentBlockType = 'text';
                 }
-                res.write(`data: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: delta.content } })}\n\n`);
+                res.write(`data: ${safeJsonStringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: delta.content } })}\n\n`);
               }
               
               if (delta?.tool_calls) {
                 const tc = delta.tool_calls[0];
                 console.log(`[Bridge] Tool Call: ${tc.function?.name || 'delta'}`);
                 if (currentBlockType !== 'tool_use') {
-                  if (currentBlockType) res.write(`data: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
-                  res.write(`data: ${JSON.stringify({ type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: tc.id || 'tc_'+Date.now(), name: tc.function?.name || '' } })}\n\n`);
+                  if (currentBlockType) res.write(`data: ${safeJsonStringify({ type: 'content_block_stop', index: 0 })}\n\n`);
+                  res.write(`data: ${safeJsonStringify({ type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: tc.id || 'tc_'+Date.now(), name: tc.function?.name || '' } })}\n\n`);
                   currentBlockType = 'tool_use';
                 }
                 if (tc.function?.arguments) {
-                  res.write(`data: ${JSON.stringify({ type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: tc.function.arguments } })}\n\n`);
+                  res.write(`data: ${safeJsonStringify({ type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: tc.function.arguments } })}\n\n`);
                 }
               }
             } catch (e) {
@@ -922,9 +1067,10 @@ app.post('/v1/messages', async (req, res) => {
           }
         }
       }
-      if (currentBlockType) res.write(`data: ${JSON.stringify({ type: 'content_block_stop', index: currentBlockType === 'text' ? 0 : 1 })}\n\n`);
-      res.write(`data: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 0 } })}\n\n`);
-      res.write(`data: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+      if (currentBlockType) res.write(`data: ${safeJsonStringify({ type: 'content_block_stop', index: currentBlockType === 'text' ? 0 : 1 })}\n\n`);
+      const finalStopReason = currentBlockType === 'tool_use' ? 'tool_use' : 'end_turn';
+      res.write(`data: ${safeJsonStringify({ type: 'message_delta', delta: { stop_reason: finalStopReason, stop_sequence: null }, usage: { output_tokens: 0 } })}\n\n`);
+      res.write(`data: ${safeJsonStringify({ type: 'message_stop' })}\n\n`);
       res.end();
     } else {
       const data = await response.json();
@@ -965,11 +1111,14 @@ app.post('/v1/messages', async (req, res) => {
         anthropicResponse.stop_reason = 'tool_use';
       }
 
-      res.json(anthropicResponse);
+      res.json(JSON.parse(safeJsonStringify(anthropicResponse, 0)));
     }
   } catch (err) {
     console.error('[Bridge Error]', err);
-    res.status(500).json({ error: { message: err.message } });
+    let message = err.message;
+    if (err.code === 'ECONNRESET') message = 'Connection reset by remote host. Check if you are using the correct protocol (http/https) and that your API key is correct.';
+    if (err.code === 'ECONNREFUSED') message = 'Connection refused. Check if the remote LLM server is running and accessible.';
+    res.status(500).json({ error: { message: message } });
   }
 });
 
